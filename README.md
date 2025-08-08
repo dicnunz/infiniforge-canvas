@@ -27,3 +27,13 @@ http://localhost:5500/index.html?safe=1
 - UI + game glue: you.
 - Local inference: LM Studio.
 - Model: `gpt-oss-20b` (OpenAI Community OSS).
+
+## Live demo
+
+Once deployed via GitHub Pages, a live version of this app will be available at:
+
+```
+https://YOURUSER.github.io/infiniforge-canvas/
+```
+
+Replace `YOURUSER` with your GitHub username once Pages is enabled.
