@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfiniForge — Canvas (safe v2)</title>
+<style>
+  :root{ --bg:#0b0c0f; --panel:#12141a; --ink:#e9ecf1; --muted:#96a0ae; --line:#1f2430; }
+  *{box-sizing:border-box}
+  body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b0c0f; color:var(--ink)}
+  header{display:flex; gap:12px; align-items:center; padding:10px 12px; border-bottom:1px solid var(--line); background:#0d1016; position:sticky; top:0; z-index:10}
+  .row{display:grid; grid-template-columns:280px 1fr; gap:12px; padding:12px}
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:10px}
+  .side{display:flex; flex-direction:column; gap:10px; height:calc(100vh - 70px)}
+  .inv{flex:1; overflow:auto; display:grid; gap:8px}
+  .item{display:flex; align-items:center; gap:8px; padding:8px; border:1px solid var(--line); border-radius:10px; background:#0e1117; cursor:grab; user-select:none}
+  .item .pill{margin-left:auto; font-size:11px; color:#9aa4b2; border:1px solid var(--line); padding:2px 6px; border-radius:999px}
+  .controls{display:flex; flex-wrap:wrap; gap:6px}
+  input,button,select{background:#0e1117; color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:8px; font-size:14px}
+  button{cursor:pointer}
+  .board{position:relative; min-height:70vh; background:
+    radial-gradient(560px 320px at 70% -10%, #0f1320, transparent 60%),
+    radial-gradient(520px 300px at 0% 120%, #0e1017, transparent 50%);
+    border:1px solid var(--line); border-radius:14px; overflow:hidden}
+  .node{position:absolute; padding:6px 10px; background:#0f141c; border:1px solid #2a3345; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,.25); cursor:grab; user-select:none; white-space:nowrap}
+  .node.dragging{opacity:.8; cursor:grabbing}
+  .hint{color:#9aa4b2; font-size:12px}
+  .log{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas; font-size:12px; background:#0b0e13; border:1px dashed var(--line); border-radius:10px; padding:8px; height:120px; overflow:auto}
+</style>
+<body>
+<header>
+  <div><b>InfiniForge — Canvas</b> <span style="color:#9aa4b2">(safe v2)</span></div>
+  <div style="margin-left:auto" class="controls">
+    <button id="ping">Ping</button>
+    <button id="clearBoard">Clear board</button>
+    <button id="reset">Reset world</button>
+  </div>
+</header>
+
+<div class="row">
+  <section class="panel side">
+    <div class="controls">
+      <input id="search" placeholder="Search…">
+      <button id="seed">Seed</button>
+    </div>
+    <div class="inv" id="inventory"></div>
+    <div class="panel" style="background:#0b0e13">
+      <div class="hint">Base URL</div>
+      <input id="base" value="http://localhost:1234/v1">
+      <div class="hint" style="margin-top:6px">Model</div>
+      <input id="model" value="gpt-oss-20b">
+      <div class="hint" style="margin-top:6px"><label><input type="checkbox" id="lockCanon" checked> Lock early canon</label></div>
+      <div class="hint" style="margin-top:6px"><label><input type="checkbox" id="useLLM" checked> Use model for unknowns</label></div>
+      <div class="hint" style="margin-top:6px">Temp <input id="temp" type="number" step="0.05" min="0" max="1.2" value="0.15"> • Max tokens <input id="maxtok" type="number" min="64" max="2048" value="512"></div>
+      <div class="hint" style="margin-top:6px">Drag from left to board; drop one onto another to craft.</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="board" id="board"></div>
+    <div class="log" id="log">🔧 Canvas ready (safe v2)</div>
+  </section>
+</div>
+
+<script>
+// ------- Build tag & overlay -------
+const BUILD = "safe-v2";
+(function(){
+  const qs = new URLSearchParams(location.search);
+  const SAFE = qs.has("safe") || qs.get("mode")==="safe";
+  window.__INF_SAFE__ = SAFE;
+  window.addEventListener("error", (e)=>{
+    const o=document.createElement("div"); o.style.cssText="position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.85);color:#e9ecf1;padding:14px;font:13px ui-monospace,Menlo,Consolas;white-space:pre-wrap";
+    o.textContent = "Canvas crashed (build "+BUILD+"):\\n" + (e.message||e.error||"") + "\\n" + (e.filename||"") + ":" + (e.lineno||"");
+    document.body.appendChild(o);
+  });
+  window.addEventListener("unhandledrejection", (e)=>{
+    const o=document.createElement("div"); o.style.cssText="position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.85);color:#e9ecf1;padding:14px;font:13px ui-monospace,Menlo,Consolas;white-space:pre-wrap";
+    o.textContent = "Unhandled promise (build "+BUILD+"):\\n" + (e.reason && (e.reason.stack||e.reason.message) || String(e.reason));
+    document.body.appendChild(o);
+  });
+  console.log("[Canvas] SAFE mode:", SAFE, "BUILD:", BUILD);
+})();
+
+// ---------- Storage ----------
+const SKEY = "InfiniForge::canvas::state::v1";
+const CKEY = "InfiniForge::canvas::combos::v1";
+const PKEY = "InfiniForge::canvas::prefs::v1";
+function lsGetJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ localStorage.removeItem(key); return fallback; }}
+let state = window.__INF_SAFE__ ? {items:[]} : lsGetJSON(SKEY, {items:[]});
+let combos = window.__INF_SAFE__ ? {} : lsGetJSON(CKEY, {});
+let prefs = window.__INF_SAFE__ ? { base:"http://localhost:1234/v1", model:"gpt-oss-20b", temp:0.15, maxtok:512, lockCanon:true, useLLM:true } : lsGetJSON(PKEY, { base:"http://localhost:1234/v1", model:"gpt-oss-20b", temp:0.15, maxtok:512, lockCanon:true, useLLM:true });
+const save = ()=>{ localStorage.setItem(SKEY, JSON.stringify(state)); localStorage.setItem(CKEY, JSON.stringify(combos)); localStorage.setItem(PKEY, JSON.stringify(prefs)); };
+
+// ---------- Canon ----------
+const CANON = {
+  "air|earth": {"name":"Dust","emoji":"💨","rarity":1,"description":"Fine grains kicked into the wind.","tags":["air","earth"]},
+  "air|water": {"name":"Rain","emoji":"🌧️","rarity":1,"description":"Sky-borne water returns to earth.","tags":["sky","water"]},
+  "earth|water": {"name":"Mud","emoji":"🟤","rarity":1,"description":"Wet earth that clings and shapes.","tags":["soil","water"]},
+  "fire|water": {"name":"Steam","emoji":"🫧","rarity":1,"description":"Vapor born of heat and cool.","tags":["heat","vapor"]},
+  "fire|air": {"name":"Smoke","emoji":"💨","rarity":1,"description":"Breath of flame gone dim.","tags":["soot","air"]},
+  "fire|earth": {"name":"Lava","emoji":"🌋","rarity":2,"description":"Stone made liquid by fury.","tags":["magma","heat"]},
+  "earth|rain": {"name":"Plant","emoji":"🌱","rarity":2,"description":"Green insistence from wet soil.","tags":["life","sprout"]},
+  "plant|time": {"name":"Tree","emoji":"🌳","rarity":2,"description":"A patient tower of wood.","tags":["forest","growth"]}
+};
+
+// ---------- Seeds ----------
+const SEEDS = [
+  {name:"Fire", emoji:"🔥", rarity:1, description:"Heat, ignition."},
+  {name:"Water", emoji:"💧", rarity:1, description:"Flow, solvent."},
+  {name:"Air", emoji:"🌬️", rarity:1, description:"Breath, motion."},
+  {name:"Earth", emoji:"🪨", rarity:1, description:"Soil, stone."},
+  {name:"Time", emoji:"⏳", rarity:1, description:"Before and after."}
+];
+
+// ---------- Helpers ----------
+const el = id=>document.getElementById(id);
+const log = s=>{ const L=el("log"); L.textContent += "\\n" + s; L.scrollTop = L.scrollHeight; };
+const keyFor = (a,b)=>[a.toLowerCase(), b.toLowerCase()].sort().join("|");
+function addItem(obj){
+  const exists = state.items.find(it => it.name.toLowerCase() === obj.name.toLowerCase());
+  if (exists) return exists;
+  if (!crypto.randomUUID){ crypto.randomUUID = ()=>'id-'+Math.random().toString(16).slice(2)+'-'+Date.now(); }
+  const item = { id: crypto.randomUUID(), name: obj.name, emoji: obj.emoji||"", rarity: obj.rarity||1, desc: obj.description||obj.desc||"", x: 40 + Math.random()*360, y: 40 + Math.random()*240 };
+  state.items.push(item); save(); renderInventory(); return item;
+}
+
+// ---------- Inventory ----------
+function renderInventory(){
+  const inv = el("inventory"); inv.innerHTML="";
+  const q = (el("search").value||"").toLowerCase();
+  state.items.filter(it => it.name.toLowerCase().includes(q)).forEach(it=>{
+    const row = document.createElement("div");
+    row.className = "item"; row.draggable = true;
+    row.innerHTML = `<span>${it.emoji||"🔹"}</span><strong>${it.name}</strong><span class="pill">R${it.rarity}</span>`;
+    row.addEventListener("dragstart", ev =>{
+      ev.dataTransfer.setData("text/plain", JSON.stringify({type:"spawn", id:it.id}));
+    });
+    inv.appendChild(row);
+  });
+}
+function seedWorld(){ SEEDS.forEach(addItem); renderInventory(); log("Seeded elements."); }
+
+// ---------- Board ----------
+const board = el("board");
+board.addEventListener("dragover", e=> e.preventDefault());
+board.addEventListener("drop", e=>{
+  e.preventDefault();
+  const data = e.dataTransfer.getData("text/plain");
+  try{
+    const msg = JSON.parse(data);
+    if(msg.type==="spawn"){
+      const base = state.items.find(i=>i.id===msg.id);
+      if(base) spawnNode(base, e.offsetX, e.offsetY);
+    }
+  }catch(_){}
+});
+function spawnNode(item, x, y){
+  const n = document.createElement("div");
+  n.className = "node"; n.textContent = `${item.emoji?item.emoji+" ":""}${item.name}`;
+  n.style.left = (x-20)+"px"; n.style.top = (y-12)+"px";
+  n.dataset.name = item.name;
+  board.appendChild(n);
+  makeDraggable(n);
+}
+function centerOf(node){
+  const r = node.getBoundingClientRect();
+  const rb = board.getBoundingClientRect();
+  return {x:r.left - rb.left + r.width/2, y:r.top - rb.top + r.height/2};
+}
+function nodesOverlap(a,b){
+  const A = centerOf(a), B = centerOf(b);
+  const d = Math.hypot(A.x-B.x, A.y-B.y);
+  return d < 50;
+}
+function makeDraggable(node){
+  let startX, startY, startLeft, startTop;
+  const onMove = (e)=>{
+    const dx = (e.clientX||e.touches?.[0]?.clientX) - startX;
+    const dy = (e.clientY||e.touches?.[0]?.clientY) - startY;
+    node.style.left = (startLeft + dx) + "px";
+    node.style.top  = (startTop + dy) + "px";
+  };
+  const onUp = ()=>{
+    node.classList.remove("dragging");
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    const nodes = Array.from(board.querySelectorAll(".node"));
+    for(const other of nodes){
+      if(other===node) continue;
+      if(nodesOverlap(node, other)){
+        craft(node.dataset.name, other.dataset.name, centerOf(node));
+        node.remove(); other.remove(); break;
+      }
+    }
+  };
+  node.addEventListener("mousedown", e=>{
+    node.classList.add("dragging");
+    startX = e.clientX; startY = e.clientY;
+    const rect = node.getBoundingClientRect();
+    const brect = board.getBoundingClientRect();
+    startLeft = rect.left - brect.left; startTop = rect.top - brect.top;
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+// ---------- GPT-OSS plumbing ----------
+function firstTextChoice(j){
+  try{
+    const c0 = j?.choices?.[0]; if(!c0) return "";
+    if (c0.message){
+      if (Array.isArray(c0.message.content)){
+        const seg = c0.message.content.find(p => p && (p.text || p.type==="text"));
+        return (seg && (seg.text || seg.content || "")) || "";
+      }
+      return c0.message.content || "";
+    }
+    return c0.text || "";
+  }catch(_){ return ""; }
+}
+function stripFinal(text){
+  if(!text) return text;
+  const idx = text.indexOf("<|channel|>final<|message|>");
+  return idx!==-1 ? text.slice(idx + "<|channel|>final<|message|>".length) : text;
+}
+function extractJSON(text){
+  const s = stripFinal(String(text));
+  try{ return JSON.parse(s); }catch(_){}
+  const candidates=[];
+  for(let i=0;i<s.length;i++){
+    const ch=s[i]; if(ch!=='{'&&ch!=='[') continue;
+    let stack=[ch], inStr=false, esc=false;
+    for(let j=i=1;j<s.length;j++){
+      const c=s[j];
+      if(inStr){
+        if(esc){ esc=false; continue; }
+        if(c==='\\\\'){ esc=true; }
+        else if(c==='"'){ inStr=false; }
+        continue;
+      }
+      if(c==='"'){ inStr=true; continue; }
+      if(c==='{'||c==='[') stack.push(c);
+      else if(c==='}'||c===']'){
+        stack.pop();
+        if(stack.length===0){ candidates.push(s.slice(i,j+1)); break; }
+      }
+    }
+  }
+  let best=null;
+  for(const cand of candidates){ if(cand[0]==='{' && (!best || cand.length>best.length)) best=cand; }
+  if(!best) for(const cand of candidates){ if(!best || cand.length>best.length) best=cand; }
+  if(!best) return null;
+  try{ return JSON.parse(best); }catch(_){ return null; }
+}
+
+async function askModel(a, b){
+  const url = (prefs.base||"http://localhost:1234/v1") + "/chat/completions";
+  const body = {
+    model: prefs.model||"gpt-oss-20b", stream:false,
+    messages: [
+      {role:"system", content:`You run a combination-crafting game. Reply with ONE JSON object ONLY: {"name":"...","rarity":1,"description":"<=240 chars","emoji":"","tags":["a","b"]} Make the result intuitive for simple base pairs; get more creative later. No markdown.`},
+      {role:"user", content:`Craft a single item from "${a}" and "${b}". Output JSON only.`}
+    ],
+    temperature: Number(prefs.temp)||0.15, top_p: 0.9, max_tokens: Number(prefs.maxtok)||512
+  };
+  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json", "Authorization":"Bearer lm-studio"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  const text = firstTextChoice(j);
+  const obj = extractJSON(text);
+  if(obj) return obj;
+  // fallback
+  const prompt = `${body.messages[0].content}\n\nCraft from "${a}" and "${b}". JSON only.`;
+  const r2 = await fetch((prefs.base||"http://localhost:1234/v1") + "/completions", {
+    method:"POST", headers:{"Content-Type":"application/json", "Authorization":"Bearer lm-studio"},
+    body: JSON.stringify({model: body.model, prompt, temperature: body.temperature, top_p: 0.9, max_tokens: body.max_tokens, stream:false})
+  });
+  const j2 = await r2.json();
+  const text2 = j2?.choices?.[0]?.text || "";
+  const obj2 = extractJSON(text2);
+  if(obj2) return obj2;
+  throw new Error("Model didn't return JSON.");
+}
+
+// ---------- Craft ----------
+async function craft(aName, bName, where){
+  const k = keyFor(aName, bName);
+  log(`⏳ Crafting ${aName} + ${bName} …`);
+  const CAN = CANON[k];
+  if(el("lockCanon").checked && CAN){
+    const it = addItem(CAN); spawnNode(it, where.x, where.y);
+    combos[k] = it.name; save(); log(`✅ ${aName} + ${bName} → ${it.name} (canon)`); return;
+  }
+  if(combos[k]){
+    const it = state.items.find(i=>i.name.toLowerCase() === combos[k].toLowerCase());
+    if(it){ spawnNode(it, where.x, where.y); log(`↩︎ ${aName} + ${bName} → ${it.name} (cached)`); return; }
+  }
+  if(!el("useLLM").checked){ log("❌ Unknown combo and model disabled."); return; }
+  try{
+    const out = await askModel(aName, bName);
+    if(!out || !out.name) throw new Error("No name from model.");
+    const it = addItem(out); combos[k] = it.name; save();
+    spawnNode(it, where.x, where.y); log(`✅ ${aName} + ${bName} → ${it.name}`);
+  }catch(e){ log("❌ " + e.message); }
+}
+
+// ---------- Wiring & Boot ----------
+el("seed").onclick = seedWorld;
+el("search").oninput = renderInventory;
+el("reset").onclick = ()=>{ if(confirm("Reset world & combos?")){ state={items:[]}; combos={}; save(); renderInventory(); board.innerHTML=""; log("World reset."); }};
+el("clearBoard").onclick = ()=>{ board.innerHTML=""; log("Board cleared."); };
+el("ping").onclick = async ()=>{
+  try{ const r = await fetch((prefs.base||"http://localhost:1234/v1") + "/models"); const j = await r.json(); log("✅ models: " + (j.data?.map(m=>m.id).join(", ")||"none")); }catch(e){ log("❌ ping: " + e.message); }
+};
+
+function boot(){
+  renderInventory();
+  if(state.items.length===0){ seedWorld(); }
+  log("🚀 Boot complete ("+BUILD+")");
+  console.log("[Canvas] Boot complete", BUILD);
+}
+if(document.readyState === "loading"){ window.addEventListener("DOMContentLoaded", boot, {once:true}); } else { boot(); }
+</script>
+</body>
+</html>
